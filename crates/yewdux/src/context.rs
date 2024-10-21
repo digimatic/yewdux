@@ -1,6 +1,6 @@
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::rc::Rc;
-
-use anymap::AnyMap;
 
 use crate::{
     mrc::Mrc,
@@ -48,8 +48,9 @@ impl<S: Store> Entry<S> {
 /// ```
 #[derive(Clone, Default, PartialEq)]
 pub struct Context {
-    inner: Mrc<AnyMap>,
+    inner: Mrc<HashMap<TypeId, Box<dyn Any>>>,
 }
+
 
 impl Context {
     pub fn new() -> Self {
@@ -68,39 +69,29 @@ impl Context {
     }
 
     pub(crate) fn get_or_init<S: Store>(&self) -> Entry<S> {
-        // Get context, or None if it doesn't exist.
-        //
-        // We use an option here because a new Store should not be created during this borrow. We
-        // want to allow this store access to other stores during creation, so cannot be borrowing
-        // the global resource while initializing. Instead we create a temporary placeholder, which
-        // indicates the store needs to be created. Without this indicator we would have needed to
-        // check if the map contains the entry beforehand, which would have meant two map lookups
-        // per call instead of just one.
-        let maybe_entry = self.inner.with_mut(|x| {
-            x.entry::<Mrc<Option<Entry<S>>>>()
-                .or_insert_with(|| None.into())
+        let type_id = TypeId::of::<S>();
+        let maybe_entry = self.inner.with_mut(|map| {
+            map.entry(type_id)
+                .or_insert_with(|| Box::new(None::<Entry<S>>))
+                .downcast_mut::<Option<Entry<S>>>()
+                .expect("Type mismatch")
                 .clone()
         });
 
-        // If it doesn't exist, create and save the new store.
-        let exists = maybe_entry.borrow().is_some();
-        if !exists {
-            // Init store outside of borrow. This allows the store to access other stores when it
-            // is being created.
+        if maybe_entry.is_none() {
             let entry = Entry {
                 store: Mrc::new(Rc::new(S::new(self))),
             };
-
-            *maybe_entry.borrow_mut() = Some(entry);
+            self.inner.with_mut(|map| {
+                *map.get_mut(&type_id)
+                    .expect("Entry should exist")
+                    .downcast_mut::<Option<Entry<S>>>()
+                    .expect("Type mismatch") = Some(entry.clone());
+            });
+            entry
+        } else {
+            maybe_entry.expect("Context not initialized")
         }
-
-        // Now we get the context, which must be initialized because we already checked above.
-        let entry = maybe_entry
-            .borrow()
-            .clone()
-            .expect("Context not initialized");
-
-        entry
     }
 
     pub fn reduce<S: Store, R: Reducer<S>>(&self, r: R) {
